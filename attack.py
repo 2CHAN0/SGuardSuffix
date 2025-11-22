@@ -3,6 +3,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import random
 from .config import Config
+import os
+import json
+import datetime
 
 class GCGAttack:
     def __init__(self, model, tokenizer):
@@ -92,7 +95,7 @@ class GCGAttack:
         
         return new_control_toks
 
-    def run(self, malicious_prompt):
+    def run(self, malicious_prompt, save_dir=None, save_interval=10):
         """
         Runs the GCG attack for a single malicious prompt.
         """
@@ -190,5 +193,19 @@ class GCGAttack:
                     
             if step % 10 == 0:
                 print(f"Step {step}: Loss = {best_loss:.4f}, Suffix = {best_suffix}")
+
+            if save_dir and save_interval and (step + 1) % save_interval == 0:
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                
+                save_path = os.path.join(save_dir, f"checkpoint_step_{step+1}.json")
+                with open(save_path, "w") as f:
+                    json.dump({
+                        "step": step + 1,
+                        "loss": best_loss,
+                        "suffix": best_suffix,
+                        "prompt": malicious_prompt,
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }, f, indent=4)
                 
         return best_suffix, best_loss
