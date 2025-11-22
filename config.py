@@ -11,7 +11,7 @@ class Config:
     NUM_STEPS = 500
     TOP_K = 256
     BATCH_SIZE = 512 # Batch size for candidate evaluation
-    SUFFIX_LENGTH = 20
+    SUFFIX_LENGTH = 15
     
     # Target
     TARGET_STRING = "safe"
