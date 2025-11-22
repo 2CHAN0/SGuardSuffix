@@ -13,7 +13,54 @@ class GCGAttack:
         self.tokenizer = tokenizer
         self.device = Config.DEVICE
         
-    def token_gradients(self, input_ids, suffix_slice, target_slice, loss_slice):
+        # Get safe/unsafe token IDs from vocabulary
+        vocab = self.tokenizer.get_vocab()
+        self.safe_token_id = vocab['safe']
+        self.unsafe_token_id = vocab['unsafe']
+        print(f"Safe token ID: {self.safe_token_id}, Unsafe token ID: {self.unsafe_token_id}")
+        
+    def get_input_ids_with_suffix(self, malicious_prompt, suffix_str):
+        """
+        Constructs input IDs using chat template with suffix appended to prompt.
+        Returns: (input_ids, suffix_start_idx, suffix_end_idx)
+        """
+        # Create the full prompt with suffix
+        full_content = f"{malicious_prompt} {suffix_str}"
+        messages = [{"role": "user", "content": full_content}]
+        
+        input_ids = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors='pt'
+        )[0].to(self.device)
+        
+        # To find suffix position, tokenize without suffix and compare
+        messages_without_suffix = [{"role": "user", "content": malicious_prompt}]
+        input_ids_without_suffix = self.tokenizer.apply_chat_template(
+            messages_without_suffix,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors='pt'
+        )[0].to(self.device)
+        
+        # Tokenize just the suffix to get its length
+        suffix_tokens = self.tokenizer(f" {suffix_str}", add_special_tokens=False, return_tensors='pt').input_ids[0]
+        
+        # Suffix should be inserted before the generation prompt
+        # Find where they differ
+        len_without = len(input_ids_without_suffix)
+        len_with = len(input_ids)
+        suffix_len = len(suffix_tokens)
+        
+        # Estimate suffix position (this is approximate)
+        # Typically, suffix is added near the end, before generation prompt tokens
+        suffix_end_idx = len_without
+        suffix_start_idx = suffix_end_idx - suffix_len
+        
+        return input_ids, suffix_start_idx, suffix_end_idx
+        
+    def token_gradients(self, input_ids, suffix_slice):
         """
         Computes gradients of the loss with respect to the one-hot text input
         at the suffix positions.
@@ -33,7 +80,7 @@ class GCGAttack:
             input_ids.unsqueeze(1), 
             torch.ones(one_hot.shape[:2], device=self.device, dtype=embed_weights.dtype)
         )
-        one_hot.requires_grad_()
+        one_hot.requires_grad_(True)
         
         # Get embeddings
         input_embeds = (one_hot @ embed_weights).unsqueeze(0)
@@ -42,24 +89,31 @@ class GCGAttack:
         outputs = self.model(inputs_embeds=input_embeds)
         logits = outputs.logits
         
-        # Calculate loss
-        # We want to maximize the probability of the target string
-        # Target is "safe"
+        # For SGuard: we only care about the FIRST generated token
+        # The logit at position -1 predicts the next token
+        next_token_logits = logits[0, -1, :]  # [vocab_size]
         
-        # Shift logits and labels for next-token prediction
-        shift_logits = logits[0, loss_slice, :].contiguous()
-        shift_labels = input_ids[target_slice].contiguous()
+        # Extract logits for safe and unsafe tokens only
+        selected_logits = torch.stack([
+            next_token_logits[self.safe_token_id],
+            next_token_logits[self.unsafe_token_id]
+        ])
         
-        loss = F.cross_entropy(shift_logits, shift_labels)
+        # Convert to probabilities
+        probs = torch.softmax(selected_logits, dim=0)
+        
+        # Loss: negative log probability of 'safe' token
+        # We want to MINIMIZE this (= maximize P(safe))
+        loss = -torch.log(probs[0] + 1e-10)
         
         # Backward pass
         loss.backward()
         
         # Get gradients for the suffix tokens
         grad = one_hot.grad.clone()
-        grad = grad / grad.norm(dim=-1, keepdim=True)
+        grad = grad / (grad.norm(dim=-1, keepdim=True) + 1e-10)
         
-        return grad[suffix_slice]
+        return grad[suffix_slice], loss.item(), probs[0].item()
 
     def sample_control(self, control_toks, grad, batch_size, topk=256):
         """
@@ -95,104 +149,130 @@ class GCGAttack:
         
         return new_control_toks
 
+    def evaluate_candidates(self, malicious_prompt, candidates):
+        """
+        Evaluate a batch of candidate suffixes.
+        
+        Args:
+            malicious_prompt: The malicious prompt string
+            candidates: [batch_size, suffix_len] candidate suffix token IDs
+        
+        Returns:
+            losses: [batch_size] loss for each candidate
+            safe_probs: [batch_size] probability of 'safe' token for each candidate
+        """
+        batch_size = candidates.shape[0]
+        
+        losses = []
+        safe_probs = []
+        
+        # Evaluate each candidate (could be optimized with true batching)
+        for i in range(batch_size):
+            candidate_suffix_ids = candidates[i]
+            candidate_suffix_str = self.tokenizer.decode(candidate_suffix_ids, skip_special_tokens=True)
+            
+            # Construct input with chat template
+            full_content = f"{malicious_prompt} {candidate_suffix_str}"
+            messages = [{"role": "user", "content": full_content}]
+            
+            input_ids = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors='pt'
+            ).to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model(input_ids)
+                logits = outputs.logits
+                
+                # Get logits for the FIRST generated token
+                next_token_logits = logits[0, -1, :]
+                
+                # Extract logits for safe and unsafe tokens
+                selected_logits = torch.stack([
+                    next_token_logits[self.safe_token_id],
+                    next_token_logits[self.unsafe_token_id]
+                ])
+                
+                # Convert to probabilities
+                probs = torch.softmax(selected_logits, dim=0)
+                
+                # Loss and probability
+                safe_prob = probs[0].item()
+                loss = -torch.log(probs[0] + 1e-10).item()
+                
+                losses.append(loss)
+                safe_probs.append(safe_prob)
+        
+        return torch.tensor(losses, device=self.device), torch.tensor(safe_probs, device=self.device)
+
     def run(self, malicious_prompt, save_dir=None, save_interval=10):
         """
         Runs the GCG attack for a single malicious prompt.
         """
+        print(f"\n{'='*60}")
+        print(f"Starting GCG attack on prompt: '{malicious_prompt}'")
+        print(f"{'='*60}\n")
+        
         # Initialize suffix
-        suffix = "! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! ! !" # 20 tokens
-        suffix_ids = self.tokenizer(suffix, return_tensors="pt", add_special_tokens=False).input_ids[0].to(self.device)
-        
-        target = Config.TARGET_STRING
-        target_ids = self.tokenizer(target, return_tensors="pt", add_special_tokens=False).input_ids[0].to(self.device)
-        
-        prompt_ids = self.tokenizer(malicious_prompt, return_tensors="pt", add_special_tokens=False).input_ids[0].to(self.device)
-        
-        # Define slices
-        # Input structure: [Prompt] [Suffix] [Target]
-        # We want to optimize [Suffix] such that P([Target] | [Prompt] [Suffix]) is maximized
+        suffix = "! ! ! ! ! ! ! ! ! !"
+        suffix_ids = self.tokenizer(f" {suffix}", return_tensors="pt", add_special_tokens=False).input_ids[0].to(self.device)
         
         best_loss = float('inf')
         best_suffix = suffix
+        best_suffix_ids = suffix_ids.clone()
+        best_safe_prob = 0.0
         
         for step in tqdm(range(Config.NUM_STEPS), desc="Attack Steps"):
             
-            # Construct full input sequence for gradient computation
-            # Note: We don't include target in input for generation, but we need it for loss calculation
-            # For CausalLM, we feed [Prompt] [Suffix] and calculate loss on [Target]
+            # Decode current suffix
+            current_suffix_str = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
             
-            # Actually, for gradient computation we need to feed everything including target to get logits for target positions
-            # But we only want gradients w.r.t suffix
+            # Get input IDs with chat template
+            input_ids, suffix_start, suffix_end = self.get_input_ids_with_suffix(
+                malicious_prompt, current_suffix_str
+            )
             
-            input_ids = torch.cat([prompt_ids, suffix_ids, target_ids])
+            # Adjust suffix slice based on actual tokenization
+            # The suffix might not be exactly where we think due to tokenization
+            # For now, use the estimated positions
+            suffix_slice = slice(suffix_start, suffix_end)
             
-            # Slices indices
-            p_len = len(prompt_ids)
-            s_len = len(suffix_ids)
-            t_len = len(target_ids)
-            
-            suffix_slice = slice(p_len, p_len + s_len)
-            target_slice = slice(p_len + s_len, p_len + s_len + t_len)
-            loss_slice = slice(p_len + s_len - 1, p_len + s_len + t_len - 1) # Logits are shifted by 1
+            # Make sure slice is valid
+            if suffix_start < 0 or suffix_end > len(input_ids):
+                print(f"Warning: Invalid suffix slice [{suffix_start}:{suffix_end}] for input length {len(input_ids)}")
+                # Fallback: assume suffix is near the end
+                suffix_slice = slice(max(0, len(input_ids) - len(suffix_ids)), len(input_ids))
             
             # 1. Compute Gradients
-            grad = self.token_gradients(input_ids, suffix_slice, target_slice, loss_slice)
+            try:
+                grad, loss, safe_prob = self.token_gradients(input_ids, suffix_slice)
+            except Exception as e:
+                print(f"Error in gradient computation: {e}")
+                print(f"Input IDs length: {len(input_ids)}, Suffix slice: {suffix_slice}")
+                continue
             
             # 2. Generate Candidates
             candidates = self.sample_control(suffix_ids, grad, Config.BATCH_SIZE, Config.TOP_K)
             
             # 3. Evaluate Candidates
-            # Create batch of inputs
-            # [Batch, Seq_Len]
-            # Each row: [Prompt] [Candidate_Suffix] [Target]
+            candidate_losses, candidate_safe_probs = self.evaluate_candidates(
+                malicious_prompt, candidates
+            )
             
-            # We need to be careful with memory here.
-            # Let's evaluate in mini-batches if needed, but for now assume it fits.
+            # 4. Select best candidate
+            min_loss, best_idx = torch.min(candidate_losses, dim=0)
             
-            # Construct batch
-            # prompt_ids: [P] -> [B, P]
-            # candidates: [B, S]
-            # target_ids: [T] -> [B, T]
-            
-            b_prompts = prompt_ids.repeat(Config.BATCH_SIZE, 1)
-            b_targets = target_ids.repeat(Config.BATCH_SIZE, 1)
-            
-            b_input_ids = torch.cat([b_prompts, candidates, b_targets], dim=1)
-            
-            with torch.no_grad():
-                outputs = self.model(b_input_ids)
-                logits = outputs.logits
+            if min_loss < best_loss:
+                best_loss = min_loss.item()
+                best_suffix_ids = candidates[best_idx].clone()
+                best_suffix = self.tokenizer.decode(best_suffix_ids, skip_special_tokens=True)
+                best_safe_prob = candidate_safe_probs[best_idx].item()
+                suffix_ids = best_suffix_ids.clone()
                 
-                # Calculate loss for each candidate
-                # Logits: [B, Seq_Len, Vocab]
-                # We care about logits at loss_slice positions matching target_ids
-                
-                # shift_logits: [B, T, Vocab]
-                shift_logits = logits[:, loss_slice, :].contiguous()
-                # shift_labels: [B, T]
-                shift_labels = b_targets
-                
-                # Flatten for cross_entropy
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    reduction='none'
-                )
-                
-                # Reshape to [B, T] and sum/mean over T
-                loss = loss.view(Config.BATCH_SIZE, -1).mean(dim=1)
-                
-                # Find best candidate
-                min_loss, best_idx = torch.min(loss, dim=0)
-                
-                if min_loss < best_loss:
-                    best_loss = min_loss.item()
-                    best_suffix_ids = candidates[best_idx]
-                    best_suffix = self.tokenizer.decode(best_suffix_ids)
-                    suffix_ids = best_suffix_ids
-                    
             if step % 10 == 0:
-                print(f"Step {step}: Loss = {best_loss:.4f}, Suffix = {best_suffix}")
+                print(f"Step {step}: Loss = {best_loss:.4f}, Safe Prob = {best_safe_prob:.4f}, Suffix = '{best_suffix}'")
 
             if save_dir and save_interval and (step + 1) % save_interval == 0:
                 if not os.path.exists(save_dir):
@@ -203,9 +283,17 @@ class GCGAttack:
                     json.dump({
                         "step": step + 1,
                         "loss": best_loss,
+                        "safe_prob": best_safe_prob,
                         "suffix": best_suffix,
                         "prompt": malicious_prompt,
                         "timestamp": datetime.datetime.now().isoformat()
                     }, f, indent=4)
+        
+        print(f"\n{'='*60}")
+        print(f"Attack completed!")
+        print(f"Best suffix: '{best_suffix}'")
+        print(f"Best loss: {best_loss:.4f}")
+        print(f"Best safe probability: {best_safe_prob:.4f}")
+        print(f"{'='*60}\n")
                 
-        return best_suffix, best_suffix_ids, best_loss
+        return best_suffix, best_suffix_ids, best_loss, best_safe_prob
