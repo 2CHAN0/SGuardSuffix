@@ -2,15 +2,18 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from .config import Config
 
-def load_model_and_tokenizer():
+def load_model_and_tokenizer(model_name_or_path=None):
     """
     Loads the SGuard model and tokenizer.
     """
-    print(f"Loading model: {Config.MODEL_ID} on {Config.DEVICE}")
+    if model_name_or_path is None:
+        model_name_or_path = Config.MODEL_ID
+        
+    print(f"Loading model: {model_name_or_path} on {Config.DEVICE}")
     
-    tokenizer = AutoTokenizer.from_pretrained(Config.MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     model = AutoModelForCausalLM.from_pretrained(
-        Config.MODEL_ID,
+        model_name_or_path,
         torch_dtype=torch.float16 if Config.DEVICE != "cpu" else torch.float32,
         device_map=Config.DEVICE,
         trust_remote_code=True
