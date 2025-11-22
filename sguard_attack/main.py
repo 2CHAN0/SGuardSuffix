@@ -1,0 +1,54 @@
+from sguard_attack.config import Config
+from sguard_attack.model_utils import load_model_and_tokenizer
+from sguard_attack.dataset import Dataset
+from sguard_attack.attack import GCGAttack
+import torch
+
+def main():
+    # 1. Load Model & Tokenizer
+    model, tokenizer = load_model_and_tokenizer()
+    
+    # 2. Load Dataset
+    dataset = Dataset()
+    
+    # 3. Initialize Attack
+    attacker = GCGAttack(model, tokenizer)
+    
+    print(f"Starting attack on {len(dataset)} prompts...")
+    
+    results = []
+    
+    for i, malicious_prompt in enumerate(dataset):
+        print(f"\n[{i+1}/{len(dataset)}] Attacking prompt: {malicious_prompt}")
+        
+        best_suffix, best_loss = attacker.run(malicious_prompt)
+        
+        print(f"Result for '{malicious_prompt}':")
+        print(f"  Best Suffix: {best_suffix}")
+        print(f"  Final Loss: {best_loss:.4f}")
+        
+        # Verification
+        full_input = malicious_prompt + " " + best_suffix
+        inputs = tokenizer(full_input, return_tensors="pt").to(Config.DEVICE)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=10)
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+        print(f"  Model Output: {response}")
+        
+        results.append({
+            "prompt": malicious_prompt,
+            "suffix": best_suffix,
+            "loss": best_loss,
+            "output": response
+        })
+        
+    print("\n--- Attack Summary ---")
+    for res in results:
+        print(f"Prompt: {res['prompt']}")
+        print(f"Suffix: {res['suffix']}")
+        print(f"Output: {res['output']}")
+        print("-" * 20)
+
+if __name__ == "__main__":
+    main()
