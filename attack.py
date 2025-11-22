@@ -208,4 +208,4 @@ class GCGAttack:
                         "timestamp": datetime.datetime.now().isoformat()
                     }, f, indent=4)
                 
-        return best_suffix, best_loss
+        return best_suffix, best_suffix_ids, best_loss
