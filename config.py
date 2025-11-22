@@ -8,9 +8,9 @@ class Config:
         DEVICE = "cuda"
     
     # Attack Configuration
-    NUM_STEPS = 50
+    NUM_STEPS = 500
     TOP_K = 256
-    BATCH_SIZE = 128 # Batch size for candidate evaluation
+    BATCH_SIZE = 512 # Batch size for candidate evaluation
     SUFFIX_LENGTH = 20
     
     # Target
