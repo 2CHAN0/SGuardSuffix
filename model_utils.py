@@ -21,9 +21,15 @@ def load_model_and_tokenizer(model_name_or_path=None):
     
     model.eval()
     
-    # Ensure we can compute gradients w.r.t inputs (embeddings)
-    # This is crucial for GCG attack
+    # Freeze all model parameters (we don't want to update the model)
     for param in model.parameters():
         param.requires_grad = False
+    
+    # But we DO need gradients w.r.t. embeddings for GCG attack
+    # The gradient will be computed on the one-hot input, not the embedding weights
+    # So we need to ensure the embedding layer can participate in the computational graph
+    embed_layer = model.get_input_embeddings()
+    for param in embed_layer.parameters():
+        param.requires_grad = True
         
     return model, tokenizer
