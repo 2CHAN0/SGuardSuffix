@@ -180,9 +180,21 @@ class GCGAttack:
         """
         control_toks = control_toks.to(self.device)
         original_control_toks = control_toks.repeat(batch_size, 1)
+        
+        # CRITICAL FIX: Use grad's actual shape, not control_toks length
+        # grad shape is [actual_suffix_len, vocab_size] which may differ from len(control_toks)
+        actual_suffix_len = grad.shape[0]
+        
+        # DEBUG: Print shapes for validation
+        if torch.rand(1).item() < 0.01:  # Print 1% of the time to avoid spam
+            print(f"[sample_control DEBUG]")
+            print(f"  control_toks length: {len(control_toks)}")
+            print(f"  grad shape: {grad.shape}")
+            print(f"  Using actual_suffix_len: {actual_suffix_len}")
+        
         # Randomly select a position to modify for each batch item
-        # We want to modify one token for each candidate in the batch
-        new_token_pos = torch.randint(0, len(control_toks), (batch_size,), device=self.device)
+        # MUST use actual_suffix_len, not len(control_toks)!
+        new_token_pos = torch.randint(0, actual_suffix_len, (batch_size,), device=self.device)
         
         # Get the top-k indices for the suffix tokens: [suffix_len, topk]
         topk_indices = torch.topk(grad, topk, dim=1).indices
