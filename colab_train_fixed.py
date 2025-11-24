@@ -1,8 +1,12 @@
 # SGuard Suffix Attack Training (Colab Compatible)
 # Copy and paste this code into a Google Colab cell to run the training.
 
-import sys
+# Enable CUDA error debugging
 import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+print("CUDA_LAUNCH_BLOCKING enabled for precise error tracking")
+
+import sys
 import datetime
 import torch
 import json

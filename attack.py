@@ -13,28 +13,61 @@ class GCGAttack:
         self.tokenizer = tokenizer
         self.device = Config.DEVICE
         
-        # Get safe/unsafe token IDs
-        # Use encode to be sure we get the correct ID for the token string
-        # We assume "safe" and "unsafe" are single tokens in the vocab
+        # DIAGNOSTIC: Check tokenizer and model compatibility
+        tokenizer_vocab_size = len(tokenizer)
+        model_vocab_size = self.model.get_input_embeddings().num_embeddings
+        
+        print(f"="*60)
+        print(f"DIAGNOSTIC INFO:")
+        print(f"  Tokenizer vocab size: {tokenizer_vocab_size}")
+        print(f"  Model embedding size: {model_vocab_size}")
+        print(f"  Match: {tokenizer_vocab_size == model_vocab_size}")
+        print(f"="*60)
+        
+        # Get safe/unsafe token IDs using multiple methods for validation
         safe_ids = self.tokenizer.encode("safe", add_special_tokens=False)
         unsafe_ids = self.tokenizer.encode("unsafe", add_special_tokens=False)
         
-        if len(safe_ids) != 1 or len(unsafe_ids) != 1:
-            print(f"WARNING: 'safe' or 'unsafe' tokenized to multiple tokens: safe={safe_ids}, unsafe={unsafe_ids}")
-            # Fallback to first token if multiple
-            self.safe_token_id = safe_ids[0]
-            self.unsafe_token_id = unsafe_ids[0]
-        else:
-            self.safe_token_id = safe_ids[0]
-            self.unsafe_token_id = unsafe_ids[0]
-            
-        # Verify token IDs are within embedding range
-        vocab_size = self.model.get_input_embeddings().num_embeddings
-        print(f"Safe token ID: {self.safe_token_id}, Unsafe token ID: {self.unsafe_token_id}")
-        print(f"Model embedding size: {vocab_size}")
+        print(f"\nToken ID Validation:")
+        print(f"  tokenizer.encode('safe'): {safe_ids}")
+        print(f"  tokenizer.encode('unsafe'): {unsafe_ids}")
         
-        if self.safe_token_id >= vocab_size or self.unsafe_token_id >= vocab_size:
-            raise ValueError(f"Token IDs out of bounds! safe={self.safe_token_id}, unsafe={self.unsafe_token_id}, vocab_size={vocab_size}")
+        if len(safe_ids) != 1 or len(unsafe_ids) != 1:
+            raise ValueError(f"ERROR: 'safe' or 'unsafe' tokenized to multiple tokens: safe={safe_ids}, unsafe={unsafe_ids}")
+            
+        self.safe_token_id = safe_ids[0]
+        self.unsafe_token_id = unsafe_ids[0]
+        
+        # Verify token IDs are within BOTH tokenizer and model range
+        print(f"  safe_token_id: {self.safe_token_id} (within model: {self.safe_token_id < model_vocab_size})")
+        print(f"  unsafe_token_id: {self.unsafe_token_id} (within model: {self.unsafe_token_id < model_vocab_size})")
+        
+        if self.safe_token_id >= model_vocab_size or self.unsafe_token_id >= model_vocab_size:
+            raise ValueError(
+                f"Token IDs out of bounds!\n"
+                f"  safe={self.safe_token_id}, unsafe={self.unsafe_token_id}\n"
+                f"  model_vocab_size={model_vocab_size}"
+            )
+        
+        # Store vocab size for validation throughout
+        self.vocab_size = model_vocab_size
+        print(f"\nGCGAttack initialized successfully!\n")
+        
+    def _validate_input_ids(self, input_ids, context=""):
+        """Validate that all input IDs are within vocab range."""
+        max_id = torch.max(input_ids).item()
+        min_id = torch.min(input_ids).item()
+        
+        if max_id >= self.vocab_size or min_id < 0:
+            error_msg = (
+                f"VALIDATION ERROR [{context}]:\n"
+                f"  input_ids range: [{min_id}, {max_id}]\n"
+                f"  vocab_size: {self.vocab_size}\n"
+                f"  input_ids shape: {input_ids.shape}\n"
+                f"  input_ids: {input_ids.tolist()[:50]}..."  # First 50 for debugging
+            )
+            raise ValueError(error_msg)
+        return True
         
     def get_input_ids_with_suffix(self, malicious_prompt, suffix_str):
         """
@@ -51,6 +84,9 @@ class GCGAttack:
             tokenize=True,
             return_tensors='pt'
         )[0].to(self.device)
+        
+        # VALIDATE: Check input_ids after chat template
+        self._validate_input_ids(input_ids, "get_input_ids_with_suffix - with suffix")
         
         # To find suffix position, tokenize without suffix and compare
         messages_without_suffix = [{"role": "user", "content": malicious_prompt}]
@@ -167,6 +203,16 @@ class GCGAttack:
             new_token_val
         )
         
+        # VALIDATE: Check all candidates are within vocab range
+        max_tok = torch.max(new_control_toks).item()
+        min_tok = torch.min(new_control_toks).item()
+        if max_tok >= self.vocab_size or min_tok < 0:
+            raise ValueError(
+                f"Candidate tokens out of bounds!\n"
+                f"  Range: [{min_tok}, {max_tok}]\n"
+                f"  vocab_size: {self.vocab_size}"
+            )
+        
         return new_control_toks
 
     def evaluate_candidates(self, malicious_prompt, candidates):
@@ -238,6 +284,21 @@ class GCGAttack:
         # Initialize suffix
         suffix = "! ! ! ! ! ! ! ! ! !"
         suffix_ids = self.tokenizer(f" {suffix}", return_tensors="pt", add_special_tokens=False).input_ids[0].to(self.device)
+        
+        print(f"Initial suffix tokenization:")
+        print(f"  Suffix string: '{suffix}'")
+        print(f"  Suffix IDs: {suffix_ids.tolist()}")
+        print(f"  Suffix length: {len(suffix_ids)}")
+        
+        # VALIDATE: Initial suffix IDs
+        max_suffix_id = torch.max(suffix_ids).item()
+        min_suffix_id = torch.min(suffix_ids).item()
+        print(f"  ID range: [{min_suffix_id}, {max_suffix_id}]")
+        
+        if max_suffix_id >= self.vocab_size:
+            print(f"  WARNING: Initial suffix contains out-of-bounds token ID {max_suffix_id}!")
+            print(f"  Clipping to vocab_size - 1 = {self.vocab_size - 1}")
+            suffix_ids = torch.clamp(suffix_ids, 0, self.vocab_size - 1)
         
         best_loss = float('inf')
         best_suffix = suffix
