@@ -13,11 +13,28 @@ class GCGAttack:
         self.tokenizer = tokenizer
         self.device = Config.DEVICE
         
-        # Get safe/unsafe token IDs from vocabulary
-        vocab = self.tokenizer.get_vocab()
-        self.safe_token_id = vocab['safe']
-        self.unsafe_token_id = vocab['unsafe']
+        # Get safe/unsafe token IDs
+        # Use encode to be sure we get the correct ID for the token string
+        # We assume "safe" and "unsafe" are single tokens in the vocab
+        safe_ids = self.tokenizer.encode("safe", add_special_tokens=False)
+        unsafe_ids = self.tokenizer.encode("unsafe", add_special_tokens=False)
+        
+        if len(safe_ids) != 1 or len(unsafe_ids) != 1:
+            print(f"WARNING: 'safe' or 'unsafe' tokenized to multiple tokens: safe={safe_ids}, unsafe={unsafe_ids}")
+            # Fallback to first token if multiple
+            self.safe_token_id = safe_ids[0]
+            self.unsafe_token_id = unsafe_ids[0]
+        else:
+            self.safe_token_id = safe_ids[0]
+            self.unsafe_token_id = unsafe_ids[0]
+            
+        # Verify token IDs are within embedding range
+        vocab_size = self.model.get_input_embeddings().num_embeddings
         print(f"Safe token ID: {self.safe_token_id}, Unsafe token ID: {self.unsafe_token_id}")
+        print(f"Model embedding size: {vocab_size}")
+        
+        if self.safe_token_id >= vocab_size or self.unsafe_token_id >= vocab_size:
+            raise ValueError(f"Token IDs out of bounds! safe={self.safe_token_id}, unsafe={self.unsafe_token_id}, vocab_size={vocab_size}")
         
     def get_input_ids_with_suffix(self, malicious_prompt, suffix_str):
         """
@@ -67,6 +84,12 @@ class GCGAttack:
         """
         # Create embeddings matrix
         embed_weights = self.model.get_input_embeddings().weight
+        vocab_size = embed_weights.shape[0]
+        
+        # Check for out-of-bounds input_ids
+        if torch.any(input_ids >= vocab_size):
+            max_id = torch.max(input_ids).item()
+            raise ValueError(f"Input IDs contain value {max_id} which is >= vocab size {vocab_size}")
         
         # One-hot encode the input_ids
         one_hot = torch.zeros(

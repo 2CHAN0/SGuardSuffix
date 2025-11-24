@@ -103,8 +103,9 @@ for i, malicious_prompt in enumerate(dataset):
     print("\n--- Inference Test (Chat Template) ---")
     
     vocab = tokenizer.get_vocab()
-    safe_token_id = vocab['safe']
-    unsafe_token_id = vocab['unsafe']
+    # Use encode for consistency with attack.py
+    safe_token_id = tokenizer.encode("safe", add_special_tokens=False)[0]
+    unsafe_token_id = tokenizer.encode("unsafe", add_special_tokens=False)[0]
     
     full_content = f"{malicious_prompt} {best_suffix}"
     messages = [{"role": "user", "content": full_content}]
