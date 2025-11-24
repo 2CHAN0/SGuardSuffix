@@ -121,12 +121,9 @@ class GCGAttack:
         """
         control_toks = control_toks.to(self.device)
         original_control_toks = control_toks.repeat(batch_size, 1)
-        new_token_pos = torch.arange(
-            0, 
-            len(control_toks), 
-            len(control_toks) / batch_size,
-            device=self.device
-        ).type(torch.int64)
+        # Randomly select a position to modify for each batch item
+        # We want to modify one token for each candidate in the batch
+        new_token_pos = torch.randint(0, len(control_toks), (batch_size,), device=self.device)
         
         # Get the top-k indices for the suffix tokens: [suffix_len, topk]
         topk_indices = torch.topk(grad, topk, dim=1).indices
